@@ -38,6 +38,7 @@ EM_AGGR = 2          # aggress at 9998/10002
 
 TOM_STEP = 1         # 1 tick inside market
 TOM_MAX_SKEW = 2     # cap skew at 2 ticks so we always stay inside market
+TOM_MIN_SPREAD = 2
 
 LIMITS = {"EMERALDS": 10, "TOMATOES": 20}
 
@@ -68,23 +69,25 @@ class Trader:
         best_bid = max(depth.buy_orders)  if depth.buy_orders  else 0
         best_ask = min(depth.sell_orders) if depth.sell_orders else 999_999
 
+        proj_pos = pos
+
         # ── 1. Aggressive fills ───────────────────────────────────────────────
         # Buy anything <= 9998, sell anything >= 10002
         for ask_px in sorted(depth.sell_orders):
             if ask_px > FAIR_EM - EM_AGGR:
                 break
-            qty = min(-depth.sell_orders[ask_px], lim - pos)
+            qty = min(-depth.sell_orders[ask_px], lim - proj_pos)
             if qty > 0:
                 orders.append(Order("EMERALDS", ask_px, qty))
-                pos += qty
+                proj_pos += qty
 
         for bid_px in sorted(depth.buy_orders, reverse=True):
             if bid_px < FAIR_EM + EM_AGGR:
                 break
-            qty = min(depth.buy_orders[bid_px], lim + pos)
+            qty = min(depth.buy_orders[bid_px], lim + proj_pos)
             if qty > 0:
                 orders.append(Order("EMERALDS", bid_px, -qty))
-                pos -= qty
+                proj_pos -= qty
 
         # ── 2. Passive quotes with exponential inventory skew ─────────────────
         # Key insight: skew must be STRONG near limits but GENTLE in the middle.
@@ -95,7 +98,7 @@ class Trader:
         # This way we ALWAYS post both sides but make the inventory-worsening
         # side very unlikely to fill.
         
-        inv = pos / lim  # normalised: -1.0 to +1.0
+        inv = proj_pos / lim  # normalised: -1.0 to +1.0
         
         # Exponential skew: gentle in middle, aggressive near limits
         # bid_skew: positive = bid moves DOWN (discourages buying when long)
@@ -103,20 +106,21 @@ class Trader:
         ask_skew = int(round(inv * inv * inv * 7))   # same direction (both shift same way)
 
         our_bid = FAIR_EM - EM_EDGE - bid_skew
-        our_ask = FAIR_EM + EM_EDGE - ask_skew  # negative bid_skew when short → ask rises
+        our_ask = FAIR_EM + EM_EDGE + ask_skew  # negative bid_skew when short → ask rises
 
         # Hard clamps: never cross fair
         our_bid = min(our_bid, FAIR_EM - 1)
         our_ask = max(our_ask, FAIR_EM + 1)
 
         # Post bid if it improves on market AND we're not at long limit
-        if our_bid > best_bid and pos < lim:
-            buy_cap = lim - pos
+        if proj_pos < lim:
+            buy_cap = lim - proj_pos
             orders.append(Order("EMERALDS", our_bid, buy_cap))
 
+
         # Post ask if it improves on market AND we're not at short limit
-        if our_ask < best_ask and pos > -lim:
-            sell_cap = lim + pos
+        if proj_pos > -lim:
+            sell_cap = lim + proj_pos
             orders.append(Order("EMERALDS", our_ask, -sell_cap))
 
         return orders
@@ -132,31 +136,51 @@ class Trader:
         best_bid = max(depth.buy_orders)
         best_ask = min(depth.sell_orders)
         mid = (best_bid + best_ask) / 2
+        # ── Aggressive fills ──────────────────────────────────────────────────────
+
+        proj_pos = pos
+
+        for ask_px in sorted(depth.sell_orders):
+            if ask_px >= mid:
+               break
+            qty = min(-depth.sell_orders[ask_px], lim - proj_pos)
+            if qty > 0:
+                orders.append(Order("TOMATOES", ask_px, qty))
+                proj_pos += qty
+
+        for bid_px in sorted(depth.buy_orders, reverse=True):
+            if bid_px <= mid:
+                break
+            qty = min(depth.buy_orders[bid_px], lim + proj_pos)
+            if qty > 0:
+                orders.append(Order("TOMATOES", bid_px, -qty))
+                proj_pos -= qty
+
 
         # Inventory skew: CAPPED at TOM_MAX_SKEW (2 ticks) so we ALWAYS
         # stay inside the market spread and get filled
-        inv_frac = pos / lim
+        inv_frac = proj_pos / lim
         inv_adj = max(-TOM_MAX_SKEW, min(TOM_MAX_SKEW, round(inv_frac * TOM_MAX_SKEW * 2)))
 
         our_bid = best_bid + TOM_STEP - inv_adj
-        our_ask = best_ask - TOM_STEP - inv_adj
+        our_ask = best_ask - TOM_STEP + inv_adj
 
         # Sanity: ensure valid spread
-        if our_bid >= our_ask:
+        if our_ask - our_bid < TOM_MIN_SPREAD:
             mid_int = (best_bid + best_ask) // 2
-            our_bid = mid_int - 1
-            our_ask = mid_int + 1
+            our_bid = mid_int - (TOM_MIN_SPREAD // 2)
+            our_ask = mid_int + (TOM_MIN_SPREAD // 2)
 
         our_bid = min(our_bid, best_ask - 1)
         our_ask = max(our_ask, best_bid + 1)
 
         # Post bid if inside market and not at long limit
-        if our_bid > best_bid and pos < lim:
+        if pos < lim:
             buy_cap = lim - pos
             orders.append(Order("TOMATOES", our_bid, buy_cap))
 
         # Post ask if inside market and not at short limit
-        if our_ask < best_ask and pos > -lim:
+        if pos > -lim:
             sell_cap = lim + pos
             orders.append(Order("TOMATOES", our_ask, -sell_cap))
 
