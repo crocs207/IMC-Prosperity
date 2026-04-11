@@ -1,46 +1,10 @@
-"""
-IMC Prosperity 2026 — trader_v3.py
-====================================
-Built from surgical log analysis. Root causes identified:
-
-ROOT CAUSE 1 — EMERALDS position saturation:
-  v1 hit +10 at ts=29800 → missed 4 buy fills (22 qty × 3 edge = 66 PnL)
-  v1 hit -10 at ts=93300 → missed 7 sell fills (32 qty × 3 edge = 96 PnL)
-  v2 made it WORSE by adding even stronger skew → fewer fills overall → 1000 PnL
-  
-  FIX: Use EXPONENTIAL skew. Near limit, quotes shift so far that we barely
-  get filled on the inventory-worsening side, but still get filled on the
-  inventory-reducing side. We NEVER stop posting both sides.
-
-ROOT CAUSE 2 — EMERALDS: we sold at 10004/10005 but top traders sell at 10003:
-  We posted ask=10004 when we should post 10003. Top trader avg fill = 5.34
-  means they post at fair±3. We were posting at fair±4 (too conservative).
-  FIX: Set edge=3, never 4.
-
-ROOT CAUSE 3 — TOMATOES missed fills when market traded at 4984/4992/4993:
-  These were market trades where we weren't posting inside (position-skewed
-  our bid too far below market best bid).
-  FIX: Cap inventory skew at max 2 ticks so we always stay inside market.
-
-ROOT CAUSE 4 — Top traders fill 5.5x more qty than us:
-  They must post EVERY tick, with correct sizing. We sometimes fail to post
-  because of bad quote clamps.
-  FIX: Always post both sides. Only suppress a side when physically at limit.
-"""
 
 from datamodel import Order, OrderDepth, TradingState
 from typing import Dict, List
 import json
 
+LIMITS = {"EMERALDS": 80, "TOMATOES": 80}
 FAIR_EM = 10_000
-EM_EDGE = 3          # post 9997/10003 — matches top trader avg fill of 5.34
-EM_AGGR = 2          # aggress at 9998/10002
-
-TOM_STEP = 1         # 1 tick inside market
-TOM_MAX_SKEW = 2     # cap skew at 2 ticks so we always stay inside market
-TOM_MIN_SPREAD = 2
-
-LIMITS = {"EMERALDS": 10, "TOMATOES": 20}
 
 
 class Trader:
@@ -48,140 +12,295 @@ class Trader:
     def run(self, state: TradingState):
         result: Dict[str, List[Order]] = {}
 
+        try:
+            saved = json.loads(state.traderData) if state.traderData else {}
+        except Exception:
+            saved = {}
+
+        tom_prev_mid = saved.get("tpm", None)
+
         if "EMERALDS" in state.order_depths:
             result["EMERALDS"] = self._emeralds(
                 state.order_depths["EMERALDS"],
                 state.position.get("EMERALDS", 0),
             )
+
+        new_tom_mid = tom_prev_mid
         if "TOMATOES" in state.order_depths:
-            result["TOMATOES"] = self._tomatoes(
+            orders, new_tom_mid = self._tomatoes(
                 state.order_depths["TOMATOES"],
                 state.position.get("TOMATOES", 0),
+                tom_prev_mid,
             )
+            result["TOMATOES"] = orders
 
-        return result, 0, ""
+        new_data = json.dumps({"tpm": new_tom_mid})
+        return result, 0, new_data
 
-    # ── EMERALDS ─────────────────────────────────────────────────────────────
+    # ── EMERALDS (v22 proven logic, 1015 PnL) ────────────────────────────────
     def _emeralds(self, depth: OrderDepth, pos: int) -> List[Order]:
         orders: List[Order] = []
         lim = LIMITS["EMERALDS"]
+        fair = FAIR_EM
 
-        best_bid = max(depth.buy_orders)  if depth.buy_orders  else 0
-        best_ask = min(depth.sell_orders) if depth.sell_orders else 999_999
+        best_bid = max(depth.buy_orders) if depth.buy_orders else fair - 8
+        best_ask = min(depth.sell_orders) if depth.sell_orders else fair + 8
 
-        proj_pos = pos
+        max_buy = lim - pos
+        max_sell = lim + pos
+        tb = 0
+        ts = 0
 
-        # ── 1. Aggressive fills ───────────────────────────────────────────────
-        # Buy anything <= 9998, sell anything >= 10002
+        # Phase 1: Take mispriced
         for ask_px in sorted(depth.sell_orders):
-            if ask_px > FAIR_EM - EM_AGGR:
+            if ask_px >= fair:
                 break
-            qty = min(-depth.sell_orders[ask_px], lim - proj_pos)
+            room = max_buy - tb
+            if room <= 0:
+                break
+            qty = min(-depth.sell_orders[ask_px], room)
             if qty > 0:
                 orders.append(Order("EMERALDS", ask_px, qty))
-                proj_pos += qty
+                tb += qty
 
         for bid_px in sorted(depth.buy_orders, reverse=True):
-            if bid_px < FAIR_EM + EM_AGGR:
+            if bid_px <= fair:
                 break
-            qty = min(depth.buy_orders[bid_px], lim + proj_pos)
+            room = max_sell - ts
+            if room <= 0:
+                break
+            qty = min(depth.buy_orders[bid_px], room)
             if qty > 0:
                 orders.append(Order("EMERALDS", bid_px, -qty))
-                proj_pos -= qty
+                ts += qty
 
-        # ── 2. Passive quotes with exponential inventory skew ─────────────────
-        # Key insight: skew must be STRONG near limits but GENTLE in the middle.
-        # At pos=0: bid=9997, ask=10003 (symmetric, full size)
-        # At pos=+5: bid=9995, ask=10003 (bid shifted down 2, ask unchanged)
-        # At pos=+9: bid=9990, ask=10003 (bid shifted down 7, heavily suppressed)
-        # At pos=-9: bid=9997, ask=10010 (ask shifted up 7, heavily suppressed)
-        # This way we ALWAYS post both sides but make the inventory-worsening
-        # side very unlikely to fill.
-        
-        inv = proj_pos / lim  # normalised: -1.0 to +1.0
-        
-        # Exponential skew: gentle in middle, aggressive near limits
-        # bid_skew: positive = bid moves DOWN (discourages buying when long)
-        bid_skew = int(round(inv * inv * inv * 7))   # cubic: 0→0, 0.5→0.9, 1→7
-        ask_skew = int(round(inv * inv * inv * 7))   # same direction (both shift same way)
+        # Phase 2: Exit at fair (proven to work - aggressive take)
+        pp = pos + tb - ts
+        if pp > 10:
+            exit_qty = min(pp - 5, max_sell - ts)
+            if exit_qty > 0:
+                orders.append(Order("EMERALDS", fair, -exit_qty))
+                ts += exit_qty
+        elif pp < -10:
+            exit_qty = min(-pp - 5, max_buy - tb)
+            if exit_qty > 0:
+                orders.append(Order("EMERALDS", fair, exit_qty))
+                tb += exit_qty
 
-        our_bid = FAIR_EM - EM_EDGE - bid_skew
-        our_ask = FAIR_EM + EM_EDGE + ask_skew  # negative bid_skew when short → ask rises
+        # Phase 3: Passive quotes at 9993/10007
+        pp = pos + tb - ts
+        inv_frac = pp / lim
+        raw_skew = inv_frac * 3 + (inv_frac ** 3) * 5
+        skew = int(round(raw_skew))
 
-        # Hard clamps: never cross fair
-        our_bid = min(our_bid, FAIR_EM - 1)
-        our_ask = max(our_ask, FAIR_EM + 1)
+        our_bid = best_bid + 1 - skew
+        our_ask = best_ask - 1 - skew
+        our_bid = min(our_bid, fair - 1)
+        our_ask = max(our_ask, fair + 1)
+        if our_ask <= our_bid:
+            our_bid = fair - 1
+            our_ask = fair + 1
 
-        # Post bid if it improves on market AND we're not at long limit
-        if proj_pos < lim:
-            buy_cap = lim - proj_pos
+        # Phase 4: Size
+        buy_room = max_buy - tb
+        sell_room = max_sell - ts
+        abs_pp = abs(pp)
+
+        if pp > 0:
+            buy_cap = 0 if abs_pp > 60 else min(5, buy_room) if abs_pp > 35 else min(20, buy_room) if abs_pp > 15 else buy_room
+            sell_cap = sell_room
+        elif pp < 0:
+            sell_cap = 0 if abs_pp > 60 else min(5, sell_room) if abs_pp > 35 else min(20, sell_room) if abs_pp > 15 else sell_room
+            buy_cap = buy_room
+        else:
+            buy_cap = buy_room
+            sell_cap = sell_room
+
+        if buy_cap > 0:
             orders.append(Order("EMERALDS", our_bid, buy_cap))
-
-
-        # Post ask if it improves on market AND we're not at short limit
-        if proj_pos > -lim:
-            sell_cap = lim + proj_pos
+        if sell_cap > 0:
             orders.append(Order("EMERALDS", our_ask, -sell_cap))
 
         return orders
 
-    # ── TOMATOES ─────────────────────────────────────────────────────────────
-    def _tomatoes(self, depth: OrderDepth, pos: int) -> List[Order]:
+    # ── TOMATOES (v22 base + optimizations) ───────────────────────────────────
+    def _tomatoes(self, depth: OrderDepth, pos: int, prev_mid):
         orders: List[Order] = []
         lim = LIMITS["TOMATOES"]
 
         if not depth.buy_orders or not depth.sell_orders:
-            return orders
+            return orders, prev_mid
 
         best_bid = max(depth.buy_orders)
         best_ask = min(depth.sell_orders)
-        mid = (best_bid + best_ask) / 2
-        # ── Aggressive fills ──────────────────────────────────────────────────────
+        bid_vol = depth.buy_orders[best_bid]
+        ask_vol = abs(depth.sell_orders[best_ask])
+        spread = best_ask - best_bid
+        mid = (best_bid + best_ask) / 2.0
 
-        proj_pos = pos
+        # Fair value: VWAP mid
+        if (bid_vol + ask_vol) > 0:
+            fair = int(round(
+                (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
+            ))
+        else:
+            fair = (best_bid + best_ask) // 2
 
+        # Counter-trend signal: fade last tick's move
+        ct_adj = 0
+        if prev_mid is not None:
+            delta = mid - prev_mid
+            # AC=-0.43: after +2 move, expect -0.86 next
+            # Lean counter by ~40% of the move
+            # Use 0.8 multiplier so delta=1 rounds to 1
+            ct_adj = -int(round(delta * 0.8))
+            # Clamp to prevent over-correction
+            ct_adj = max(-2, min(2, ct_adj))
+
+        max_buy = lim - pos
+        max_sell = lim + pos
+        tb = 0
+        ts = 0
+
+        # ── Phase 1: Sweep mispriced ─────────────────────────────────────
         for ask_px in sorted(depth.sell_orders):
-            if ask_px >= mid:
-               break
-            qty = min(-depth.sell_orders[ask_px], lim - proj_pos)
+            if ask_px >= fair:
+                break
+            room = max_buy - tb
+            if room <= 0:
+                break
+            qty = min(-depth.sell_orders[ask_px], room)
             if qty > 0:
                 orders.append(Order("TOMATOES", ask_px, qty))
-                proj_pos += qty
+                tb += qty
 
         for bid_px in sorted(depth.buy_orders, reverse=True):
-            if bid_px <= mid:
+            if bid_px <= fair:
                 break
-            qty = min(depth.buy_orders[bid_px], lim + proj_pos)
+            room = max_sell - ts
+            if room <= 0:
+                break
+            qty = min(depth.buy_orders[bid_px], room)
             if qty > 0:
                 orders.append(Order("TOMATOES", bid_px, -qty))
-                proj_pos -= qty
+                ts += qty
 
+        # ── Phase 2: Exit at fair when loaded ────────────────────────────
+        pp = pos + tb - ts
+        if pp > 12:
+            exit_qty = min(pp - 8, max_sell - ts)
+            if exit_qty > 0:
+                orders.append(Order("TOMATOES", fair, -exit_qty))
+                ts += exit_qty
+        elif pp < -12:
+            exit_qty = min(-pp - 8, max_buy - tb)
+            if exit_qty > 0:
+                orders.append(Order("TOMATOES", fair, exit_qty))
+                tb += exit_qty
 
-        # Inventory skew: CAPPED at TOM_MAX_SKEW (2 ticks) so we ALWAYS
-        # stay inside the market spread and get filled
-        inv_frac = proj_pos / lim
-        inv_adj = max(-TOM_MAX_SKEW, min(TOM_MAX_SKEW, round(inv_frac * TOM_MAX_SKEW * 2)))
+        # ── Phase 3: Multi-level passive quotes ──────────────────────────
+        pp = pos + tb - ts
+        inv_frac = pp / lim
 
-        our_bid = best_bid + TOM_STEP - inv_adj
-        our_ask = best_ask - TOM_STEP + inv_adj
+        # Strong inventory skew
+        raw_skew = inv_frac * 7 + (inv_frac ** 3) * 18
+        inv_skew = int(round(raw_skew))
 
-        # Sanity: ensure valid spread
-        if our_ask - our_bid < TOM_MIN_SPREAD:
-            mid_int = (best_bid + best_ask) // 2
-            our_bid = mid_int - (TOM_MIN_SPREAD // 2)
-            our_ask = mid_int + (TOM_MIN_SPREAD // 2)
+        # Combined skew: inventory + counter-trend
+        total_skew = inv_skew + ct_adj
 
-        our_bid = min(our_bid, best_ask - 1)
-        our_ask = max(our_ask, best_bid + 1)
+        buy_room = max_buy - tb
+        sell_room = max_sell - ts
+        abs_pp = abs(pp)
 
-        # Post bid if inside market and not at long limit
-        if pos < lim:
-            buy_cap = lim - pos
-            orders.append(Order("TOMATOES", our_bid, buy_cap))
+        if spread >= 10:
+            # Inner level: 2 ticks inside BBO (proven in v22)
+            inner_bid = best_bid + 2 - total_skew
+            inner_ask = best_ask - 2 - total_skew
 
-        # Post ask if inside market and not at short limit
-        if pos > -lim:
-            sell_cap = lim + pos
-            orders.append(Order("TOMATOES", our_ask, -sell_cap))
+            # Outer level: 4 ticks inside BBO (was 5, now tighter for more fills)
+            outer_bid = best_bid + 4 - total_skew
+            outer_ask = best_ask - 4 - total_skew
 
-        return orders
+            # Clamp: inner must be inside spread
+            inner_bid = min(inner_bid, best_ask - 1)
+            inner_ask = max(inner_ask, best_bid + 1)
+            
+            # Outer must not cross inner
+            outer_bid = min(outer_bid, inner_bid - 1)
+            outer_ask = max(outer_ask, inner_ask + 1)
+            
+            # Outer must be inside spread
+            outer_bid = max(outer_bid, best_bid)
+            outer_ask = min(outer_ask, best_ask)
+
+            # Size allocation per level
+            if pp > 0:
+                # Long: throttle buys, max sells
+                if abs_pp > 30:
+                    ib_sz = 0; ob_sz = 0
+                elif abs_pp > 15:
+                    ib_sz = min(3, buy_room); ob_sz = 0
+                else:
+                    ib_sz = min(10, buy_room)
+                    ob_sz = min(max(buy_room - ib_sz, 0), 12)
+                is_sz = min(15, sell_room)
+                os_sz = min(max(sell_room - is_sz, 0), 20)
+            elif pp < 0:
+                # Short: throttle sells, max buys
+                if abs_pp > 30:
+                    is_sz = 0; os_sz = 0
+                elif abs_pp > 15:
+                    is_sz = min(3, sell_room); os_sz = 0
+                else:
+                    is_sz = min(10, sell_room)
+                    os_sz = min(max(sell_room - is_sz, 0), 12)
+                ib_sz = min(15, buy_room)
+                ob_sz = min(max(buy_room - ib_sz, 0), 20)
+            else:
+                # Flat: balanced across levels
+                ib_sz = min(12, buy_room)
+                ob_sz = min(max(buy_room - ib_sz, 0), 15)
+                is_sz = min(12, sell_room)
+                os_sz = min(max(sell_room - is_sz, 0), 15)
+
+            # Post inner
+            if ib_sz > 0:
+                orders.append(Order("TOMATOES", inner_bid, ib_sz))
+            if is_sz > 0:
+                orders.append(Order("TOMATOES", inner_ask, -is_sz))
+            # Post outer
+            if ob_sz > 0 and outer_bid >= best_bid:
+                orders.append(Order("TOMATOES", outer_bid, ob_sz))
+            if os_sz > 0 and outer_ask <= best_ask:
+                orders.append(Order("TOMATOES", outer_ask, -os_sz))
+
+        else:
+            # Tight spread: single level
+            our_bid = best_bid + 1 - total_skew
+            our_ask = best_ask - 1 - total_skew
+            if our_ask <= our_bid:
+                our_bid = fair - 1
+                our_ask = fair + 1
+            our_bid = min(our_bid, best_ask - 1)
+            our_ask = max(our_ask, best_bid + 1)
+
+            if pp > 0:
+                buy_cap = 0 if abs_pp > 25 else min(8, buy_room)
+                sell_cap = sell_room
+            elif pp < 0:
+                sell_cap = 0 if abs_pp > 25 else min(8, sell_room)
+                buy_cap = buy_room
+            else:
+                buy_cap = min(12, buy_room)
+                sell_cap = min(12, sell_room)
+
+            if buy_cap > 0:
+                orders.append(Order("TOMATOES", our_bid, buy_cap))
+            if sell_cap > 0:
+                orders.append(Order("TOMATOES", our_ask, -sell_cap))
+
+        return orders, mid
+
+    def bid(self):
+        return 0 , 
