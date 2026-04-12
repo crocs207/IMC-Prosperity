@@ -1,18 +1,3 @@
-"""
-IMC Prosperity 2026 — trader.py (v30)
-
-PARADIGM SHIFT: Size-only inventory management.
-- Prices FIXED at optimal edge (9993/10007 for EM, bid+2/bid+4 for TOM)
-- NO exit-at-fair (every fill captures edge)
-- NO price skew for inventory (prices never degrade)
-- Inventory controlled ONLY through order SIZE
-- Counter-trend on tomatoes KEPT (alpha signal, not inventory)
-
-Why this should work:
-- v24 wastes 69 emerald units at 0 edge (exit-at-fair). That's 483 lost.
-- v21 failed because price skew killed quotes at high position.
-- Size-only keeps quotes at optimal prices while controlling risk.
-"""
 
 from datamodel import Order, OrderDepth, TradingState
 from typing import Dict, List
